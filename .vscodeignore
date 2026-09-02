@@ -18,3 +18,4 @@ CLAUDE.md
 *.vsix
 .github/**
 resources/icon-source.svg
+docs/**

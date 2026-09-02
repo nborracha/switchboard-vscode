@@ -48,6 +48,8 @@ code --install-extension switchboard-0.0.1.vsix
 
 Then reload the window. Switchboard appears in the Activity Bar.
 
+Next, set up the tab layout: **[Recommended VS Code layout](docs/recommended-layout.md)**. Two minutes, and chats stop landing on top of your code.
+
 ## Commands
 
 All commands are prefixed `Switchboard:` in the Command Palette. Row-level actions (open, pin, archive, tag, rename, fork, delete, attach/stop agent) are hidden from the palette and reachable from the sidebar rows.
@@ -74,7 +76,7 @@ Stated plainly, because they are structural rather than to-do items:
 
 - **The working / ready-for-review signal is a heuristic.** It infers activity from gaps in transcript writes (60s idle threshold). The CLI writes nothing while blocked on a long tool call, so a multi-minute build or test run can still read as "ready for review." No file-based signal can distinguish the two — the information isn't on disk.
 - **Switchboard rides undocumented internals** of the official extension (its `claude-vscode.editor.open` command signature) and of Claude Code's on-disk transcript format. Both can change in any release. Every integration point has a terminal-based fallback, but behavior can still shift under you.
-- **Chats open in the all-Claude tab group.** Switchboard lets the official extension route new panels, which groups chats together. Pair it with `"workbench.editor.autoLockGroups": { "mainThreadWebview-claudeVSCodePanel": true }` to keep files out of that group.
+- **Chats open in the all-Claude tab group.** Switchboard passes no target column, so the official extension routes new panels itself and groups chats together. That is deliberate, but it needs a one-time layout setup to keep files out of that group — see [Recommended VS Code layout](docs/recommended-layout.md).
 
 ## Development
 
