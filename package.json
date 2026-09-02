@@ -1,0 +1,238 @@
+{
+  "name": "switchboard",
+  "displayName": "Switchboard",
+  "description": "Session and agent manager for Claude Code \u2014 pin, tag, archive, fork, search transcripts, and watch background agents from one sidebar.",
+  "version": "0.0.1",
+  "private": true,
+  "publisher": "nimrodk",
+  "license": "MIT",
+  "icon": "resources/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nborracha/switchboard-vscode.git"
+  },
+  "bugs": {
+    "url": "https://github.com/nborracha/switchboard-vscode/issues"
+  },
+  "homepage": "https://github.com/nborracha/switchboard-vscode#readme",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other",
+    "Snippets"
+  ],
+  "keywords": [
+    "claude",
+    "claude code",
+    "ai",
+    "agent",
+    "sessions",
+    "history",
+    "transcripts"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "switchboard",
+          "title": "Switchboard",
+          "icon": "resources/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "switchboard": [
+        {
+          "id": "switchboardSessions",
+          "name": "Sessions",
+          "type": "webview"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "switchboard.refresh",
+        "title": "Switchboard: Refresh",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "switchboard.newSession",
+        "title": "Switchboard: New Agent",
+        "icon": "$(add)"
+      },
+      {
+        "command": "switchboard.search",
+        "title": "Switchboard: Search",
+        "icon": "$(search)"
+      },
+      {
+        "command": "switchboard.searchContent",
+        "title": "Switchboard: Search Chat Content"
+      },
+      {
+        "command": "switchboard.debugLogSessions",
+        "title": "Switchboard: Log Sessions (Debug)"
+      },
+      {
+        "command": "switchboard.openSession",
+        "title": "Switchboard: Open Session"
+      },
+      {
+        "command": "switchboard.deleteSession",
+        "title": "Switchboard: Delete Session",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "switchboard.pinSession",
+        "title": "Switchboard: Pin Session",
+        "icon": "$(pin)"
+      },
+      {
+        "command": "switchboard.unpinSession",
+        "title": "Switchboard: Unpin Session",
+        "icon": "$(pinned)"
+      },
+      {
+        "command": "switchboard.archiveSession",
+        "title": "Switchboard: Archive Session",
+        "icon": "$(archive)"
+      },
+      {
+        "command": "switchboard.unarchiveSession",
+        "title": "Switchboard: Unarchive Session",
+        "icon": "$(inbox)"
+      },
+      {
+        "command": "switchboard.manageTags",
+        "title": "Switchboard: Manage Tags",
+        "icon": "$(tag)"
+      },
+      {
+        "command": "switchboard.renameSession",
+        "title": "Switchboard: Rename Session",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "switchboard.forkSession",
+        "title": "Switchboard: Fork Session",
+        "icon": "$(repo-forked)"
+      },
+      {
+        "command": "switchboard.showItemActions",
+        "title": "Switchboard: More Actions",
+        "icon": "$(ellipsis)"
+      },
+      {
+        "command": "switchboard.attachBackgroundAgent",
+        "title": "Switchboard: Attach Background Agent in Terminal"
+      },
+      {
+        "command": "switchboard.stopBackgroundAgent",
+        "title": "Switchboard: Stop Background Agent"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "switchboard.openSession",
+          "when": "false"
+        },
+        {
+          "command": "switchboard.deleteSession",
+          "when": "false"
+        },
+        {
+          "command": "switchboard.pinSession",
+          "when": "false"
+        },
+        {
+          "command": "switchboard.unpinSession",
+          "when": "false"
+        },
+        {
+          "command": "switchboard.archiveSession",
+          "when": "false"
+        },
+        {
+          "command": "switchboard.unarchiveSession",
+          "when": "false"
+        },
+        {
+          "command": "switchboard.manageTags",
+          "when": "false"
+        },
+        {
+          "command": "switchboard.renameSession",
+          "when": "false"
+        },
+        {
+          "command": "switchboard.forkSession",
+          "when": "false"
+        },
+        {
+          "command": "switchboard.attachBackgroundAgent",
+          "when": "false"
+        },
+        {
+          "command": "switchboard.stopBackgroundAgent",
+          "when": "false"
+        },
+        {
+          "command": "switchboard.showItemActions",
+          "when": "false"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "switchboard.newSession",
+          "when": "view == switchboardSessions",
+          "group": "navigation@1"
+        },
+        {
+          "command": "switchboard.search",
+          "when": "view == switchboardSessions",
+          "group": "navigation@2"
+        },
+        {
+          "command": "switchboard.refresh",
+          "when": "view == switchboardSessions",
+          "group": "navigation@3"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src",
+    "format": "prettier --check src",
+    "pretest": "npm run build && tsc -p tsconfig.json",
+    "test:unit": "mocha --ui tdd \"out/test/unit/**/*.test.js\"",
+    "test:e2e": "node ./out/test/runTest.js",
+    "test": "npm run test:unit && npm run test:e2e",
+    "package": "vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.15.0",
+    "@types/glob": "^9.0.0",
+    "@types/mocha": "^10.0.7",
+    "@types/node": "^22.10.0",
+    "@types/vscode": "^1.90.0",
+    "@vscode/test-electron": "^3.1.0",
+    "@vscode/vsce": "^3.2.1",
+    "esbuild": "^0.24.0",
+    "eslint": "^9.15.0",
+    "eslint-config-prettier": "^9.1.0",
+    "glob": "^13.0.6",
+    "mocha": "^10.7.3",
+    "prettier": "^3.3.3",
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.15.0"
+  }
+}
