@@ -31,19 +31,24 @@ Switchboard never renders its own chat UI. Opening a session hands off to the of
 
 ## Install
 
-Not published to the Marketplace. Download the `.vsix` from the
-[latest release](https://github.com/nborracha/switchboard-vscode/releases/latest), then:
+Not published to the Marketplace. Install the latest release with one command:
 
 ```bash
-code --install-extension switchboard-vX.Y.Z.vsix
+curl -fsSL -o /tmp/switchboard.vsix \
+  https://github.com/nborracha/switchboard-vscode/releases/latest/download/switchboard.vsix \
+  && code --install-extension /tmp/switchboard.vsix --force
 ```
+
+`--force` lets the same command upgrade an existing install. Every release also carries a
+version-stamped `switchboard-vX.Y.Z.vsix`, listed on the
+[releases page](https://github.com/nborracha/switchboard-vscode/releases).
 
 Or build it yourself:
 
 ```bash
 pnpm install
 pnpm run package
-code --install-extension switchboard-0.0.1.vsix
+code --install-extension switchboard-0.1.0.vsix
 ```
 
 Then reload the window. Switchboard appears in the Activity Bar.

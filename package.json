@@ -2,7 +2,7 @@
   "name": "switchboard",
   "displayName": "Switchboard",
   "description": "Session and agent manager for Claude Code \u2014 pin, tag, archive, fork, search transcripts, and watch background agents from one sidebar.",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "private": true,
   "publisher": "nimrodk",
   "license": "MIT",
