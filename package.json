@@ -2,7 +2,7 @@
   "name": "switchboard",
   "displayName": "Switchboard",
   "description": "Session and agent manager for Claude Code \u2014 pin, tag, archive, fork, search transcripts, and watch background agents from one sidebar.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "publisher": "nimrodk",
   "license": "MIT",
@@ -134,6 +134,18 @@
       {
         "command": "switchboard.stopBackgroundAgent",
         "title": "Switchboard: Stop Background Agent"
+      },
+      {
+        "command": "switchboard.resumeInTerminal",
+        "title": "Switchboard: Resume in Terminal"
+      },
+      {
+        "command": "switchboard.openForeignSession",
+        "title": "Switchboard: Open Worktree Chat"
+      },
+      {
+        "command": "switchboard.moveSessionToPrimary",
+        "title": "Switchboard: Move Chat into This Workspace"
       }
     ],
     "menus": {
@@ -180,6 +192,18 @@
         },
         {
           "command": "switchboard.stopBackgroundAgent",
+          "when": "false"
+        },
+        {
+          "command": "switchboard.resumeInTerminal",
+          "when": "false"
+        },
+        {
+          "command": "switchboard.openForeignSession",
+          "when": "false"
+        },
+        {
+          "command": "switchboard.moveSessionToPrimary",
           "when": "false"
         },
         {
