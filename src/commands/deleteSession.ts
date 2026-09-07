@@ -2,7 +2,6 @@ import * as vscode from 'vscode';
 import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 import { SessionItem, SessionListProvider } from '../sessionListProvider';
-import { MetadataStore } from '../metadataStore';
 import { fileHistoryDir, invalidateSession } from '../sessionStore';
 import { stopBackgroundAgentSafely } from '../backgroundAgents';
 
@@ -42,7 +41,6 @@ async function closeSoleClaudePanelTab(): Promise<void> {
 export function registerDeleteSessionCommand(
   context: vscode.ExtensionContext,
   listProvider: SessionListProvider,
-  metadataStore: MetadataStore,
   output: vscode.OutputChannel,
 ): void {
   context.subscriptions.push(
@@ -84,7 +82,7 @@ export function registerDeleteSessionCommand(
       }
 
       await fsp.rm(fileHistoryDir(session.sessionId), { recursive: true, force: true });
-      await metadataStore.removeSession(session.sessionId);
+      await listProvider.metadataStoreForItem(item).removeSession(session.sessionId);
 
       try {
         await closeSoleClaudePanelTab();

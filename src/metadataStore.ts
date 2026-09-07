@@ -1,6 +1,15 @@
 import * as fsp from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import * as crypto from 'node:crypto';
+
+// Derived from the full repo/worktree root path (not just its basename, which two unrelated repos
+// can share) so pin/tag sidecar stores never collide across scopes. Moved here from extension.ts
+// so SessionListProvider can build one MetadataStore per resolved scope on its own.
+export function workspaceIdentity(workspaceRoot: string): string {
+  const hash = crypto.createHash('sha256').update(workspaceRoot).digest('hex').slice(0, 8);
+  return `${path.basename(workspaceRoot)}-${hash}`;
+}
 
 export interface SessionMetadata {
   pinned?: boolean;

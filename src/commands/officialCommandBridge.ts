@@ -36,10 +36,13 @@ export async function callOfficialCommandOrFallback(
     if (await isCommandAvailable(commandId)) {
       try {
         await vscode.commands.executeCommand(commandId, ...args);
+        output.appendLine(`"${commandId}" resolved (attempt ${attempt + 1}).`);
         return;
       } catch (err) {
         output.appendLine(`"${commandId}" failed (attempt ${attempt + 1}): ${String(err)}`);
       }
+    } else {
+      output.appendLine(`"${commandId}" not registered (attempt ${attempt + 1}).`);
     }
   }
 

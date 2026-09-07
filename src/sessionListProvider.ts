@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
-import { listSessions, ParsedSession } from './sessionStore';
-import { MetadataStore } from './metadataStore';
+import * as path from 'node:path';
+import { ParsedSession, ResolvedScope, ScopedSession, listSessionsForScopes, projectsDir } from './sessionStore';
+import { MetadataStore, SessionMetadata, workspaceIdentity } from './metadataStore';
 import { readHiddenSessionIds } from './hiddenSessions';
 import { tagColor } from './tagColor';
 import { computeWorkingTransitions } from './workingState';
@@ -32,11 +33,27 @@ const WORKING_IDLE_MS = 60_000;
 // but produces no visible change (still "working"), so no refresh is pushed — the list only
 // actually redraws when a session's state truly transitions (starts, or finishes, working).
 const TICK_INTERVAL_MS = 2_000;
+// Scopes (workspace folders, their git worktrees, and each one's Claude Code project folder) are
+// re-discovered on refresh, so a worktree added or a project folder created after activation shows
+// up without a reload. Discovery runs a `git worktree list` per folder, so an un-forced refresh
+// re-discovers at most this often; the watchers on the projects dir and on `.git/worktrees`, the
+// workspace-folder change event and the explicit Refresh command force it.
+const SCOPE_REDISCOVER_MIN_MS = 30_000;
+
+/** Re-runs scope discovery + project-folder resolution — the same procedure activation runs. */
+export type ScopeResolver = () => Promise<ResolvedScope[]>;
+
+/** One line per scope, for the activation log and the "scopes changed" log. */
+export function describeScopes(scopes: readonly ResolvedScope[]): string {
+  return scopes.map((s) => `${s.label} -> ${s.projectFolder ?? '(none)'}`).join('; ');
+}
 
 /** Plain data holder — kept TreeItem-free since the list now renders as a webview, not a TreeView. */
 export class SessionItem {
   constructor(
     public readonly session: ParsedSession,
+    public readonly repoRoot: string,
+    public readonly repoLabel: string,
     public readonly pinned: boolean,
     public readonly archived: boolean,
     public readonly hidden: boolean,
@@ -56,6 +73,8 @@ interface ClientTag {
 interface ClientSession {
   sessionId: string;
   title: string;
+  repoLabel: string;
+  foreignScope: boolean;
   firstPrompt?: string;
   gitBranch?: string;
   lastActivity: number;
@@ -79,9 +98,24 @@ function getNonce(): string {
 
 export class SessionListProvider implements vscode.WebviewViewProvider, vscode.Disposable {
   private view: vscode.WebviewView | undefined;
-  private readonly watcher: vscode.FileSystemWatcher | undefined;
+  private readonly disposables: vscode.Disposable[] = [];
   private debounceTimer: ReturnType<typeof setTimeout> | undefined;
+  private pendingRediscover = false;
   private tickTimer: ReturnType<typeof setInterval> | undefined;
+
+  // The current scope set, replaced wholesale by rediscoverScopes(). The stores and watchers below
+  // only ever grow, so a scope that briefly disappears (a worktree being re-created) keeps both.
+  private scopes: ResolvedScope[];
+  private lastScopeDiscovery = 0;
+  private rediscovering: Promise<void> | undefined;
+  private readonly watchedRoots = new Set<string>();
+  private readonly watchedFolders = new Set<string>();
+
+  // One MetadataStore per scope, keyed by that scope's own root — keeps pins/tags/archive
+  // scoped exactly like before (one file per repo, same hashing scheme), so a workspace that was
+  // already using Switchboard with a single scope reads and writes the exact same metadata.json
+  // it always did. No migration needed for the common single-repo case.
+  private readonly metadataStores = new Map<string, MetadataStore>();
 
   // sessionIds considered "working" as of the last tick — compared against the live check each
   // tick to detect start/stop transitions without needing to refresh on every unchanged tick.
@@ -95,45 +129,139 @@ export class SessionListProvider implements vscode.WebviewViewProvider, vscode.D
   readonly onDidRequestAction = this.onDidRequestActionEmitter.event;
 
   constructor(
-    private readonly projectFolder: string | undefined,
-    private readonly workspaceRoot: string,
-    private readonly metadataStore: MetadataStore,
+    initialScopes: ResolvedScope[],
+    private readonly resolveScopes: ScopeResolver,
+    private readonly log: (line: string) => void = (): void => undefined,
   ) {
-    if (this.projectFolder) {
-      const pattern = new vscode.RelativePattern(this.projectFolder, '*.jsonl');
-      this.watcher = vscode.workspace.createFileSystemWatcher(pattern);
-      // Only structural changes (a session appearing/disappearing) refresh immediately. A plain
-      // append is picked up by the periodic tick instead (via listSessions' own parsed
-      // lastActivity, not raw file-write recency — see WORKING_IDLE_MS above) rather than
-      // reacting directly, which is what used to make the list reorder/redraw on every single
-      // append from every concurrently-running agent.
-      this.watcher.onDidCreate(() => this.scheduleRefresh());
-      this.watcher.onDidDelete(() => this.scheduleRefresh());
+    this.scopes = initialScopes;
+    this.lastScopeDiscovery = Date.now();
+    this.attachScopes(initialScopes);
 
+    // A new project folder appearing means a chat was just started in a scope that had none — the
+    // one case the per-folder watchers cannot see, because the folder they would watch did not
+    // exist yet.
+    this.watch(projectsDir(), '*', true);
+    this.disposables.push(vscode.workspace.onDidChangeWorkspaceFolders(() => this.scheduleRefresh(true)));
+  }
+
+  /** Store, watchers and the tick for every scope not seen before; a no-op for known ones. */
+  private attachScopes(scopes: ResolvedScope[]): void {
+    for (const scope of scopes) {
+      if (!this.metadataStores.has(scope.root)) {
+        this.metadataStores.set(scope.root, new MetadataStore(workspaceIdentity(scope.root)));
+      }
+      if (!this.watchedRoots.has(scope.root)) {
+        this.watchedRoots.add(scope.root);
+        // `git worktree add/remove/prune` all show up here. A worktree's own `.git` is a file, so
+        // this never fires for worktree roots themselves — harmless.
+        this.watch(path.join(scope.root, '.git', 'worktrees'), '*', true);
+      }
+      if (scope.projectFolder && !this.watchedFolders.has(scope.projectFolder)) {
+        this.watchedFolders.add(scope.projectFolder);
+        // Only structural changes (a session appearing/disappearing) refresh immediately. A plain
+        // append is picked up by the periodic tick instead (via listSessions' own parsed
+        // lastActivity, not raw file-write recency — see WORKING_IDLE_MS above) rather than
+        // reacting directly, which is what used to make the list reorder/redraw on every single
+        // append from every concurrently-running agent.
+        this.watch(scope.projectFolder, '*.jsonl', false);
+      }
+    }
+    if (!this.tickTimer && scopes.some((scope) => scope.projectFolder)) {
       this.tickTimer = setInterval(() => void this.tick(), TICK_INTERVAL_MS);
     }
   }
 
+  private watch(base: string, glob: string, rediscover: boolean): void {
+    const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(base, glob));
+    watcher.onDidCreate(() => this.scheduleRefresh(rediscover));
+    watcher.onDidDelete(() => this.scheduleRefresh(rediscover));
+    this.disposables.push(watcher);
+  }
+
+  /** The current scope set — for logging and diagnostics. */
+  getScopes(): readonly ResolvedScope[] {
+    return this.scopes;
+  }
+
+  private async rediscoverScopes(): Promise<void> {
+    if (this.rediscovering) {
+      return this.rediscovering;
+    }
+    this.rediscovering = (async () => {
+      this.lastScopeDiscovery = Date.now();
+      try {
+        const next = await this.resolveScopes();
+        const before = describeScopes(this.scopes);
+        this.scopes = next;
+        this.attachScopes(next);
+        const after = describeScopes(next);
+        if (before !== after) {
+          this.log(`Scopes changed: ${after}`);
+        }
+      } catch (err) {
+        this.log(`Scope re-discovery failed, keeping the current scopes: ${String(err)}`);
+      } finally {
+        this.rediscovering = undefined;
+      }
+    })();
+    return this.rediscovering;
+  }
+
+  /** Resolves the metadata store owning a given session item — for pin/archive/tag/delete commands. */
+  metadataStoreForItem(item: SessionItem): MetadataStore {
+    const store = this.metadataStores.get(item.repoRoot);
+    if (!store) {
+      throw new Error(`Switchboard: no metadata store resolved for repo root ${item.repoRoot}`);
+    }
+    return store;
+  }
+
+  private async mergedMetadata(): Promise<Record<string, SessionMetadata>> {
+    const all = await Promise.all([...this.metadataStores.values()].map((store) => store.getAll()));
+    return Object.assign({}, ...all);
+  }
+
+  /** Merged metadata across every scope — for the full-text content search. */
+  async getMergedMetadata(): Promise<Record<string, SessionMetadata>> {
+    return this.mergedMetadata();
+  }
+
+  /** All distinct tags in use across every scope, sorted — lets tag reuse work across repos too. */
+  async getAllTagsMerged(): Promise<string[]> {
+    const all = await Promise.all([...this.metadataStores.values()].map((store) => store.getAllTags()));
+    return [...new Set(all.flat())].sort((a, b) => a.localeCompare(b));
+  }
+
+  /** Every real session across every scope (hidden ones included) — for the full-text content search. */
+  async getAllScopedSessions(): Promise<ScopedSession[]> {
+    return listSessionsForScopes(this.scopes);
+  }
+
   // Active chats append to their transcript many times per turn; without debouncing, each
   // append would trigger an immediate full refresh, causing visible stutter during normal use.
-  private scheduleRefresh(): void {
+  private scheduleRefresh(rediscover = false): void {
+    this.pendingRediscover = this.pendingRediscover || rediscover;
     if (this.debounceTimer) {
       clearTimeout(this.debounceTimer);
     }
-    this.debounceTimer = setTimeout(() => this.refresh(), REFRESH_DEBOUNCE_MS);
+    this.debounceTimer = setTimeout(() => {
+      const rediscoverNow = this.pendingRediscover;
+      this.pendingRediscover = false;
+      void this.refresh({ rediscover: rediscoverNow });
+    }, REFRESH_DEBOUNCE_MS);
   }
 
   // Only pushes a refresh when a session's working state actually flips — a continuously-active
   // session re-confirms "still working" every tick without ever causing a redraw, and a session
   // that goes quiet triggers exactly one refresh at the moment it's flagged for review.
   private async tick(): Promise<void> {
-    if (!this.projectFolder) {
+    if (!this.scopes.some((scope) => scope.projectFolder)) {
       return;
     }
 
     // Cheap unless a file's mtime actually changed since the last parse (listSessions caches by
     // mtime), so running this every tick doesn't reintroduce the cost Round 6 was avoiding.
-    const sessions = await listSessions(this.projectFolder);
+    const sessions = await listSessionsForScopes(this.scopes);
     const lastActivityBySessionId = new Map(sessions.map((s) => [s.sessionId, s.lastActivity]));
 
     const { nowWorking, justFinished, changed } = computeWorkingTransitions(
@@ -168,7 +296,9 @@ export class SessionListProvider implements vscode.WebviewViewProvider, vscode.D
     if (this.tickTimer) {
       clearInterval(this.tickTimer);
     }
-    this.watcher?.dispose();
+    for (const disposable of this.disposables) {
+      disposable.dispose();
+    }
   }
 
   resolveWebviewView(webviewView: vscode.WebviewView): void {
@@ -187,7 +317,15 @@ export class SessionListProvider implements vscode.WebviewViewProvider, vscode.D
     });
   }
 
-  async refresh(): Promise<void> {
+  /**
+   * Re-reads everything and re-renders. Scopes are re-discovered too when asked (`rediscover`) or
+   * when the last discovery is older than SCOPE_REDISCOVER_MIN_MS — so a worktree or a project
+   * folder that appeared after activation is picked up without a reload.
+   */
+  async refresh(options: { rediscover?: boolean } = {}): Promise<void> {
+    if (options.rediscover || Date.now() - this.lastScopeDiscovery > SCOPE_REDISCOVER_MIN_MS) {
+      await this.rediscoverScopes();
+    }
     const data = await this.buildData();
     this.view?.webview.postMessage({ type: 'render', ...data });
   }
@@ -198,17 +336,34 @@ export class SessionListProvider implements vscode.WebviewViewProvider, vscode.D
     this.view?.webview.postMessage({ type: 'focusSearch' });
   }
 
+  /**
+   * True when this item's session lives in a different scope than the primary one — typically a
+   * session Claude Code (CLI >= 2.1.198) relocated into one of the repo's git worktrees when the
+   * agent entered it. Such a chat cannot be opened by the official panel in this window (verified on
+   * extension 2.1.263: its session list is built with `includeWorktrees: false`, so it declines the
+   * session and shows a blank chat), which is why the open path routes it to the chooser in
+   * `switchboard.openForeignSession` instead of `switchboard.openSession`.
+   */
+  isForeignScope(item: SessionItem): boolean {
+    return this.scopes.length > 0 && item.repoRoot !== this.scopes[0].root;
+  }
+
+  /** The primary (first) scope — this window's own workspace folder and its Claude Code project folder. */
+  primaryScope(): ResolvedScope | undefined {
+    return this.scopes[0];
+  }
+
   private async buildAllItems(): Promise<Record<SectionKind, SessionItem[]>> {
     const buckets: Record<SectionKind, SessionItem[]> = { pinned: [], chats: [], archived: [], hidden: [] };
-    if (!this.projectFolder) {
+    if (!this.scopes.some((scope) => scope.projectFolder)) {
       return buckets;
     }
 
     const [sessions, metadata, hiddenIds, backgroundAgents] = await Promise.all([
-      listSessions(this.projectFolder),
-      this.metadataStore.getAll(),
+      listSessionsForScopes(this.scopes),
+      this.mergedMetadata(),
       readHiddenSessionIds(),
-      listRunningBackgroundAgents(this.workspaceRoot),
+      listRunningBackgroundAgents(this.scopes.map((scope) => scope.root)),
     ]);
 
     for (const session of sessions) {
@@ -217,7 +372,7 @@ export class SessionListProvider implements vscode.WebviewViewProvider, vscode.D
       const archived = !!meta.archived;
       const hidden = hiddenIds.has(session.sessionId);
       const backgroundAgentId = backgroundAgents.get(session.sessionId)?.id;
-      const item = new SessionItem(session, pinned, archived, hidden, meta.tags ?? [], backgroundAgentId);
+      const item = new SessionItem(session, session.repoRoot, session.repoLabel, pinned, archived, hidden, meta.tags ?? [], backgroundAgentId);
 
       // Priority: pinned (an explicit action in this tool) beats everything else; then the
       // official extension's own hidden state; then our own archive; otherwise the main list.
@@ -251,6 +406,8 @@ export class SessionListProvider implements vscode.WebviewViewProvider, vscode.D
     return {
       sessionId: item.session.sessionId,
       title: item.session.title,
+      repoLabel: item.repoLabel,
+      foreignScope: this.isForeignScope(item),
       firstPrompt: item.session.firstPrompt,
       gitBranch: item.session.gitBranch,
       lastActivity: item.session.lastActivity,
@@ -269,14 +426,14 @@ export class SessionListProvider implements vscode.WebviewViewProvider, vscode.D
   }
 
   private async buildData(): Promise<{ sections: Record<SectionKind, ClientSession[]>; resolved: boolean }> {
-    const [buckets, allTagsSorted] = await Promise.all([this.buildAllItems(), this.metadataStore.getAllTags()]);
+    const [buckets, allTagsSorted] = await Promise.all([this.buildAllItems(), this.getAllTagsMerged()]);
     const sections = {
       pinned: buckets.pinned.map((i) => this.toClientSession(i, allTagsSorted)),
       chats: buckets.chats.map((i) => this.toClientSession(i, allTagsSorted)),
       archived: buckets.archived.map((i) => this.toClientSession(i, allTagsSorted)),
       hidden: buckets.hidden.map((i) => this.toClientSession(i, allTagsSorted)),
     };
-    return { sections, resolved: !!this.projectFolder };
+    return { sections, resolved: this.scopes.some((scope) => scope.projectFolder) };
   }
 
   private renderShell(webview: vscode.Webview): string {
@@ -314,6 +471,7 @@ export class SessionListProvider implements vscode.WebviewViewProvider, vscode.D
   .row-title.needs-review { font-weight: 700; }
   .row-tags { flex: 0 0 auto; display: flex; gap: 4px; margin-left: 6px; }
   .chip { flex: 0 0 auto; padding: 1px 7px; border-radius: 9px; font-size: 0.82em; white-space: nowrap; line-height: 1.5; }
+  .row-repo { flex: 0 1 auto; min-width: 0; max-width: 30%; overflow: hidden; text-overflow: ellipsis; opacity: 0.55; font-size: 0.82em; margin-left: 6px; white-space: nowrap; }
   .row-time { flex: 0 0 auto; opacity: 0.6; font-size: 0.85em; margin-left: 6px; white-space: nowrap; }
   .row-actions { flex: 0 0 auto; display: none; gap: 2px; margin-left: 4px; }
   .row:hover .row-actions, .row:focus-within .row-actions { display: flex; }
@@ -358,6 +516,7 @@ export class SessionListProvider implements vscode.WebviewViewProvider, vscode.D
   function sessionMatchesQuery(session, query) {
     if (session.title.toLowerCase().includes(query)) return true;
     if (session.firstPrompt && session.firstPrompt.toLowerCase().includes(query)) return true;
+    if (session.repoLabel && session.repoLabel.toLowerCase().includes(query)) return true;
     return session.tags.some((tag) => tag.name.toLowerCase().includes(query));
   }
 
@@ -379,7 +538,7 @@ export class SessionListProvider implements vscode.WebviewViewProvider, vscode.D
     return btn;
   }
 
-  function renderRow(session) {
+  function renderRow(session, showRepo) {
     const row = el('div', 'row');
     row.tabIndex = 0;
 
@@ -418,6 +577,14 @@ export class SessionListProvider implements vscode.WebviewViewProvider, vscode.D
     }
     row.appendChild(tags);
 
+    if (showRepo && session.repoLabel) {
+      const repoBadge = el('span', 'row-repo', session.repoLabel);
+      repoBadge.title = session.foreignScope
+        ? 'Lives in ' + session.repoLabel + '. The Claude Code panel in this window cannot open it from there; clicking offers to move it here, open a window at that folder, or resume it in a terminal.'
+        : session.repoLabel;
+      row.appendChild(repoBadge);
+    }
+
     row.appendChild(el('span', 'row-time', timeAgo(session.lastActivity)));
 
     const actions = el('span', 'row-actions');
@@ -452,7 +619,7 @@ export class SessionListProvider implements vscode.WebviewViewProvider, vscode.D
     return row;
   }
 
-  function renderSection(kind, sessions, forceExpanded) {
+  function renderSection(kind, sessions, forceExpanded, showRepo) {
     const wrapper = el('div');
     const collapsed = forceExpanded ? false : !!state.collapsed[kind];
 
@@ -462,7 +629,7 @@ export class SessionListProvider implements vscode.WebviewViewProvider, vscode.D
 
     const body = el('div', 'section-body' + (collapsed ? ' collapsed' : ''));
     for (const session of sessions) {
-      body.appendChild(renderRow(session));
+      body.appendChild(renderRow(session, showRepo));
     }
 
     header.addEventListener('click', () => {
@@ -492,6 +659,14 @@ export class SessionListProvider implements vscode.WebviewViewProvider, vscode.D
       return;
     }
 
+    const allRepoLabels = new Set();
+    for (const kind of SECTION_ORDER) {
+      for (const s of lastMessage.sections[kind]) {
+        if (s.repoLabel) allRepoLabels.add(s.repoLabel);
+      }
+    }
+    const showRepo = allRepoLabels.size > 1;
+
     const query = currentQuery();
     let total = 0;
     let matched = 0;
@@ -501,7 +676,7 @@ export class SessionListProvider implements vscode.WebviewViewProvider, vscode.D
       const filtered = query ? sessions.filter((s) => sessionMatchesQuery(s, query)) : sessions;
       matched += filtered.length;
       if (query && filtered.length === 0) continue;
-      root.appendChild(renderSection(kind, filtered, !!query));
+      root.appendChild(renderSection(kind, filtered, !!query, showRepo));
     }
     if (total === 0) {
       root.appendChild(el('div', 'empty', 'No Claude Code chats found for this workspace yet.'));

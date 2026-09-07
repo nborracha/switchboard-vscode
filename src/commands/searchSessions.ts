@@ -1,8 +1,7 @@
 import * as vscode from 'vscode';
 import * as fs from 'node:fs';
 import * as readline from 'node:readline';
-import { listSessions, ParsedSession } from '../sessionStore';
-import { MetadataStore } from '../metadataStore';
+import { ScopedSession } from '../sessionStore';
 import { readHiddenSessionIds } from '../hiddenSessions';
 import { SessionListProvider } from '../sessionListProvider';
 
@@ -26,14 +25,9 @@ async function fileContainsText(filePath: string, needleLower: string): Promise<
   return undefined;
 }
 
-export function registerSearchCommands(
-  context: vscode.ExtensionContext,
-  metadataStore: MetadataStore,
-  getProjectFolder: () => string | undefined,
-  listProvider: SessionListProvider,
-): void {
+export function registerSearchCommands(context: vscode.ExtensionContext, listProvider: SessionListProvider): void {
   context.subscriptions.push(
-    // The list itself now has an inline filter box (title/first-prompt/tag, live as you type), so
+    // The list itself has an inline filter box (title/first-prompt/tag/repo, live as you type), so
     // this command's job is just to reveal the view and focus that box — no more separate
     // QuickPick duplicating what the sidebar can already do inline, and filtering there leaves
     // every row's pin/archive/rename action reachable without first having to open the chat.
@@ -42,11 +36,6 @@ export function registerSearchCommands(
     }),
 
     vscode.commands.registerCommand('switchboard.searchContent', async () => {
-      const projectFolder = getProjectFolder();
-      if (!projectFolder) {
-        return;
-      }
-
       const query = await vscode.window.showInputBox({
         prompt: 'Search full chat content (slower — scans all transcripts)',
       });
@@ -56,8 +45,8 @@ export function registerSearchCommands(
 
       const needleLower = query.trim().toLowerCase();
       const [allSessions, metadata, hiddenIds] = await Promise.all([
-        listSessions(projectFolder),
-        metadataStore.getAll(),
+        listProvider.getAllScopedSessions(),
+        listProvider.getMergedMetadata(),
         readHiddenSessionIds(),
       ]);
       const sessions = allSessions.filter((s) => !hiddenIds.has(s.sessionId));
@@ -72,18 +61,18 @@ export function registerSearchCommands(
             }),
           ),
       );
-      const matches = results.filter((m): m is { session: ParsedSession; snippet: string } => !!m);
+      const matches = results.filter((m): m is { session: ScopedSession; snippet: string } => !!m);
 
       if (matches.length === 0) {
         vscode.window.showInformationMessage(`No chats contain "${query}"`);
         return;
       }
 
-      const meta = (session: ParsedSession) => metadata[session.sessionId] ?? {};
+      const meta = (session: ScopedSession) => metadata[session.sessionId] ?? {};
       const picked = await vscode.window.showQuickPick(
         matches.map(({ session, snippet }) => ({
           label: session.title,
-          description: meta(session).tags?.length ? meta(session).tags!.join(', ') : undefined,
+          description: [meta(session).tags?.join(', '), session.repoLabel].filter(Boolean).join(' · '),
           detail: snippet,
           iconPath: meta(session).pinned ? new vscode.ThemeIcon('pinned') : undefined,
           sessionId: session.sessionId,

@@ -22,6 +22,8 @@ instead:
    - `npm run typecheck` (`tsc --noEmit`, strict mode)
    - `npm run lint` (ESLint, flat config in `eslint.config.mjs`)
    - `npm run build` (esbuild bundle to `dist/extension.js`)
+   - `npm run test:unit` (mocha; pure logic lives in vscode-free modules so it can be tested here)
+   - `npm run test:e2e` (extension-host smoke test; needs a VS Code download the first time)
 2. **Self-review** — read the full diff critically before declaring a phase complete: correctness, unhandled
    edge cases, anything touching Anthropic's own `~/.claude` files that isn't strictly additive/read-only
    where it should be.
@@ -35,9 +37,12 @@ instead:
 - No `continue` in loops — use nested `if` (enforced by `no-continue` in `eslint.config.mjs`, matching
   `management`'s convention).
 - Minimal abstraction — don't build for hypothetical future requirements.
-- This extension only reads Anthropic's own `~/.claude` files, or writes to files it created itself
-  (`~/.claude-chat-manager/**`). The one deliberate exception is the explicit, user-confirmed
-  "delete session" command, whose entire purpose is real removal of an Anthropic-owned transcript
-  (the official extension's own "delete" only soft-hides it) — that's a disclosed feature, not a
-  workaround. Outside of that one confirmed action, never modify an existing Anthropic-owned file
-  in place.
+- This extension reads Anthropic's own `~/.claude` files and writes freely only to files it created
+  itself (`~/.claude-chat-manager/**`). Writes to Anthropic-owned transcripts are limited to four
+  explicit row actions, each using a form the CLI itself writes (verified against the CLI and the
+  official extension, see PLAN.md): Rename appends a `custom-title` record; Fork copies a transcript
+  to a new session id beside the original; Move-into-workspace performs the CLI's own exit-worktree
+  relocation (`rename` + `relocated` + null `worktree-state`, existing destination set aside, refused
+  while a live process holds the session); Delete removes the transcript and its sidecars. Never
+  rewrite a transcript's existing bytes, never invent a record type, and never run any of these
+  without a user action — the rest of the extension must stay read-only toward `~/.claude`.

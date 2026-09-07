@@ -1,6 +1,5 @@
 import * as vscode from 'vscode';
 import { SessionItem, SessionListProvider } from '../sessionListProvider';
-import { MetadataStore } from '../metadataStore';
 
 interface TagPickItem extends vscode.QuickPickItem {
   tagValue: string;
@@ -10,8 +9,8 @@ const CREATE_NEW_VALUE = '__create_new_tag__';
 
 /**
  * One unified flow to add and remove tags — a multi-select QuickPick over every tag already used
- * in the workspace, pre-checked with whichever ones this session already has, plus an in-flow
- * "create a new tag" entry. Toggling a checkbox on/off is the whole add/remove experience.
+ * anywhere Switchboard scans, pre-checked with whichever ones this session already has, plus an
+ * in-flow "create a new tag" entry. Toggling a checkbox on/off is the whole add/remove experience.
  */
 async function manageTagsFlow(tagUniverseInit: string[], currentTags: string[], sessionTitle: string): Promise<string[]> {
   let tagUniverse = [...tagUniverseInit];
@@ -60,19 +59,15 @@ async function manageTagsFlow(tagUniverseInit: string[], currentTags: string[], 
   }
 }
 
-export function registerTagCommands(
-  context: vscode.ExtensionContext,
-  listProvider: SessionListProvider,
-  metadataStore: MetadataStore,
-): void {
+export function registerTagCommands(context: vscode.ExtensionContext, listProvider: SessionListProvider): void {
   context.subscriptions.push(
     vscode.commands.registerCommand('switchboard.manageTags', async (item?: SessionItem) => {
       if (!item) {
         return;
       }
-      const allTags = await metadataStore.getAllTags();
+      const allTags = await listProvider.getAllTagsMerged();
       const finalTags = await manageTagsFlow(allTags, item.tags, item.session.title);
-      await metadataStore.setTags(item.session.sessionId, finalTags);
+      await listProvider.metadataStoreForItem(item).setTags(item.session.sessionId, finalTags);
       listProvider.refresh();
     }),
   );

@@ -22,11 +22,15 @@ export interface ParsedSession {
 // Claude Code itself honors CLAUDE_CONFIG_DIR (seen in the official extension's env handling) —
 // respecting it here keeps us correct on such setups and lets tests point at a fixture dir
 // instead of ever touching the developer's real history.
-function claudeHome(): string {
+export function claudeHome(): string {
   return process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
 }
 
-function projectsDir(): string {
+function isEnoent(err: unknown): boolean {
+  return typeof err === 'object' && err !== null && (err as { code?: string }).code === 'ENOENT';
+}
+
+export function projectsDir(): string {
   return path.join(claudeHome(), 'projects');
 }
 
@@ -35,8 +39,35 @@ export function fileHistoryDir(sessionId: string): string {
   return path.join(claudeHome(), 'file-history', sessionId);
 }
 
+// Reverse-engineered from real folders on disk: every `/`, `\\`, AND `.` in the cwd becomes `-`
+// (confirmed against a real git worktree path — its `.worktrees` segment produces a literal
+// double-dash `--worktrees-` in the folder name, from the path separator and the leading dot each
+// contributing their own dash). Previously this only replaced path separators, which happened to
+// still work for every workspace root tried so far only because none of them contained a dot.
 function naiveEncode(cwd: string): string {
-  return cwd.replace(/[/\\]/g, '-');
+  return cwd.replace(/[/\\.]/g, '-');
+}
+
+/**
+ * The folder Claude Code itself would create for `root` (its deterministic encoding, see
+ * `naiveEncode`) — for writing into a scope that has no project folder yet, e.g. moving a chat into
+ * a workspace no chat was ever started in. `resolveProjectFolder` is for reading: it prefers a
+ * folder that already exists, whatever its name.
+ */
+export function defaultProjectFolder(root: string): string {
+  return path.join(projectsDir(), naiveEncode(root));
+}
+
+async function exists(p: string): Promise<boolean> {
+  try {
+    await fsp.access(p);
+    return true;
+  } catch (err) {
+    if (isEnoent(err)) {
+      return false;
+    }
+    throw err;
+  }
 }
 
 const NOISE_MARKERS = [
@@ -111,18 +142,30 @@ async function readCwdHint(jsonlPath: string): Promise<string | undefined> {
 }
 
 /**
- * Resolves the `~/.claude/projects/<...>` folder for a workspace root without hand-rolling
- * Claude's path-encoding scheme: matches on the `cwd` field already present in each session's
- * transcript, falling back to the observed naive encoding only if no folder's sessions carry it.
+ * Resolves the `~/.claude/projects/<...>` folder for a workspace root.
  *
- * If more than one folder's sessions carry a matching `cwd` (e.g. a reused scratch path used by
- * two unrelated project instances over time), the folder with the most recently modified session
- * wins rather than whichever `readdir` happens to return first.
+ * Tries Claude Code's own deterministic path-encoding first (see `naiveEncode`) — this is the
+ * ONLY reliable strategy for a workspace root an agent `cd`ed into mid-session (e.g. a git
+ * worktree): the file Claude Code stores for that session keeps its ORIGINAL cwd in its content
+ * for however many lines came before the `cd`, so content-sniffing for a matching `cwd` field can
+ * never find a match for the worktree's own root, only for whichever root the file started under.
+ *
+ * Falls back to sniffing every candidate folder's session files for a matching `cwd` field only
+ * when the encoded name doesn't exist — e.g. an older folder created before this encoding was
+ * confirmed, or one some other Claude Code version named differently. If more than one folder's
+ * sessions carry a matching `cwd` (e.g. a reused scratch path used by two unrelated project
+ * instances over time), the folder with the most recently modified session wins rather than
+ * whichever `readdir` happens to return first.
  */
 export async function resolveProjectFolder(workspaceRoot: string): Promise<string | undefined> {
   const dir = projectsDir();
   if (!fs.existsSync(dir)) {
     return undefined;
+  }
+
+  const encoded = path.join(dir, naiveEncode(workspaceRoot));
+  if (fs.existsSync(encoded)) {
+    return encoded;
   }
 
   const entries = await fsp.readdir(dir, { withFileTypes: true });
@@ -148,13 +191,11 @@ export async function resolveProjectFolder(workspaceRoot: string): Promise<strin
     }),
   );
 
-  if (matches.length > 0) {
-    matches.sort((a, b) => b.mostRecentMtime - a.mostRecentMtime);
-    return matches[0].folder;
+  if (matches.length === 0) {
+    return undefined;
   }
-
-  const naive = path.join(dir, naiveEncode(workspaceRoot));
-  return fs.existsSync(naive) ? naive : undefined;
+  matches.sort((a, b) => b.mostRecentMtime - a.mostRecentMtime);
+  return matches[0].folder;
 }
 
 type ParsedFields = Omit<ParsedSession, 'lastModified' | 'hasSubagents'>;
@@ -199,6 +240,97 @@ export async function forkSession(filePath: string, oldSessionId: string): Promi
   const newFilePath = path.join(path.dirname(filePath), `${newSessionId}.jsonl`);
   await fsp.writeFile(newFilePath, forked, 'utf8');
   return { newSessionId, newFilePath };
+}
+
+/**
+ * The two records Claude Code itself appends when a session leaves a worktree (verified against the
+ * CLI's `relocateSessionTranscript` and `saveWorktreeState(undefined)`): a `relocated` stamp naming
+ * the new cwd, and a `worktree-state` with a null session. Both record types are "last wins" for
+ * every reader — the CLI's resume, the official panel's session list, and our own parser — so
+ * appending them re-homes the session for all of them at once.
+ */
+export function relocatedRecord(sessionId: string, relocatedCwd: string): string {
+  return JSON.stringify({ type: 'relocated', sessionId, relocatedCwd });
+}
+
+export function worktreeExitRecord(sessionId: string): string {
+  return JSON.stringify({ type: 'worktree-state', worktreeSession: null, sessionId });
+}
+
+/** The CLI's own naming when a relocation finds a file already at the destination. */
+export function supersededPath(destination: string, now: number): string {
+  return `${destination}.superseded-${now}`;
+}
+
+export interface RelocationResult {
+  newFilePath: string;
+  /** Where a pre-existing destination transcript was set aside, if there was one. */
+  setAside?: string;
+  sidecarMoved: boolean;
+  /** Where a pre-existing destination `<sessionId>/` sidecar dir was set aside, if there was one. */
+  sidecarSetAside?: string;
+}
+
+/**
+ * Sets aside whatever is at `destination` (file or dir) under the CLI's own `.superseded-<ts>`
+ * naming, so a move never overwrites — returns the new path, or undefined when nothing was there.
+ */
+async function setAsideExisting(destination: string, now: number): Promise<string | undefined> {
+  if (!(await exists(destination))) {
+    return undefined;
+  }
+  const aside = supersededPath(destination, now);
+  await fsp.rename(destination, aside);
+  return aside;
+}
+
+/**
+ * Moves a session's transcript (and its `<sessionId>/` sidecar folder: subagents, custom-title.json)
+ * into another project folder and stamps it the way Claude Code's own ExitWorktree does, so the
+ * session becomes a plain session of `targetRoot` everywhere. Mirrors the CLI step for step:
+ * ensure the destination folder, set aside an existing destination as `.superseded-<ts>` rather
+ * than overwrite it, `rename` (same filesystem — both live under the projects dir), then append the
+ * stamps. Callers must make sure no Claude Code process is still writing the file (see
+ * liveSessions.ts) — the CLI only ever does this from inside the owning process.
+ */
+export async function relocateSession(
+  filePath: string,
+  sessionId: string,
+  targetProjectFolder: string,
+  targetRoot: string,
+  now: number = Date.now(),
+): Promise<RelocationResult> {
+  await fsp.mkdir(targetProjectFolder, { recursive: true, mode: 0o700 });
+  const newFilePath = path.join(targetProjectFolder, `${sessionId}.jsonl`);
+  const moving = newFilePath !== filePath;
+  let setAside: string | undefined;
+  let sidecarMoved = false;
+  let sidecarSetAside: string | undefined;
+
+  if (moving) {
+    setAside = await setAsideExisting(newFilePath, now);
+    await fsp.rename(filePath, newFilePath);
+  }
+
+  // Stamped right after the transcript itself has moved: whatever happens to the sidecar below,
+  // the transcript is never left at its new home without the records that re-home it.
+  await fsp.appendFile(newFilePath, `\n${relocatedRecord(sessionId, targetRoot)}\n${worktreeExitRecord(sessionId)}\n`, 'utf8');
+  invalidateSession(filePath);
+  invalidateSession(newFilePath);
+
+  if (moving) {
+    const oldSidecar = path.join(path.dirname(filePath), sessionId);
+    const newSidecar = path.join(targetProjectFolder, sessionId);
+    if (await exists(oldSidecar)) {
+      // A leftover sidecar at the destination (from an earlier stay of this session there) would
+      // make `rename` fail with ENOTEMPTY — set it aside the same way the CLI sets aside a file.
+      sidecarSetAside = await setAsideExisting(newSidecar, now);
+      await fsp.rename(oldSidecar, newSidecar);
+      sidecarMoved = true;
+    }
+  }
+
+  return { newFilePath, setAside, sidecarMoved, sidecarSetAside };
 }
 
 interface ParseState {
@@ -295,6 +427,46 @@ async function parseSessionCached(filePath: string, mtimeMs: number): Promise<Pa
   const parsed = await parseSession(filePath);
   parseCache.set(filePath, { mtimeMs, parsed });
   return parsed;
+}
+
+export interface ResolvedScope {
+  /** Absolute path this scope represents (a VS Code workspace folder, or one of its git worktrees). */
+  root: string;
+  /** Human label for the UI. */
+  label: string;
+  /** This scope's own Claude Code project folder, or undefined if none could be resolved. */
+  projectFolder: string | undefined;
+}
+
+export type ScopedSession = ParsedSession & { repoRoot: string; repoLabel: string };
+
+/**
+ * Resolves each scope's own Claude Code project folder into its sessions, tags every session with
+ * which repo it came from, and merges everything into one list — so a workspace with multiple
+ * open repos (or a repo with git worktrees an agent `cd`ed into mid-session) shows every real
+ * session instead of only whichever single folder a naive one-folder resolution happened to pick.
+ */
+export async function listSessionsForScopes(scopes: ResolvedScope[]): Promise<ScopedSession[]> {
+  const perScope = await Promise.all(
+    scopes.map(async (scope) => {
+      if (!scope.projectFolder) {
+        return [];
+      }
+      let sessions: ParsedSession[];
+      try {
+        sessions = await listSessions(scope.projectFolder);
+      } catch (err) {
+        // A folder resolved earlier can be gone by now (a removed worktree's history deleted by
+        // hand) — that scope simply has no sessions; the other scopes must still render.
+        if (!isEnoent(err)) {
+          throw err;
+        }
+        return [];
+      }
+      return sessions.map((session) => ({ ...session, repoRoot: scope.root, repoLabel: scope.label }));
+    }),
+  );
+  return perScope.flat().sort((a, b) => b.lastActivity - a.lastActivity);
 }
 
 /** Lists top-level chat sessions in a project folder (subagent transcripts live in subfolders and are excluded). */

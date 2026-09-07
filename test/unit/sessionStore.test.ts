@@ -34,15 +34,46 @@ suite('sessionStore', () => {
     });
   });
 
-  test('resolveProjectFolder falls back to naive path encoding when no cwd hint matches', async () => {
+  test('resolveProjectFolder resolves Claude Code\'s exact path encoding (every /, \\ and . becomes -) with no session to sniff', async () => {
     await withFixture(async ({ claudeHome, workspaceRoot }) => {
       const { resolveProjectFolder } = await import('../../src/sessionStore');
-      const naiveName = workspaceRoot.replace(/[/\\]/g, '-');
-      const projectFolder = path.join(claudeHome, 'projects', naiveName);
+      // Empty folder on purpose: there is no transcript whose cwd could match, so only the exact
+      // encoded name can find it.
+      const encodedName = workspaceRoot.replace(/[/\\.]/g, '-');
+      const projectFolder = path.join(claudeHome, 'projects', encodedName);
       await fs.mkdir(projectFolder, { recursive: true });
 
       const resolved = await resolveProjectFolder(workspaceRoot);
       assert.strictEqual(resolved, projectFolder);
+    });
+  });
+
+  test('resolveProjectFolder finds a worktree\'s own encoded folder even when its only session\'s cwd content still points at the main repo', async () => {
+    await withFixture(async ({ claudeHome, workspaceRoot }) => {
+      const { resolveProjectFolder } = await import('../../src/sessionStore');
+
+      // Reproduces the real bug: an agent `cd`ed into a git worktree mid-session, so Claude Code
+      // stored the transcript under the WORKTREE's own encoded folder, but the file's own `cwd`
+      // field (read from its first lines) still shows the ORIGINAL (main repo) cwd — content-
+      // sniffing alone can never resolve the worktree's own root from this file. `.worktrees`'s
+      // leading dot must also become its own dash (Claude Code's real encoding, confirmed on disk),
+      // not just the path separators around it.
+      const worktreeRoot = path.join(workspaceRoot, '.worktrees', 'PLAT-1');
+      const worktreeEncodedName = worktreeRoot.replace(/[/\\.]/g, '-');
+      const worktreeFolder = path.join(claudeHome, 'projects', worktreeEncodedName);
+      await fs.mkdir(worktreeFolder, { recursive: true });
+      await fs.writeFile(
+        path.join(worktreeFolder, 'sess.jsonl'),
+        `${JSON.stringify({ type: 'user', isMeta: false, cwd: workspaceRoot, message: { role: 'user', content: 'hi' } })}\n`,
+        'utf8',
+      );
+
+      const resolved = await resolveProjectFolder(worktreeRoot);
+      assert.strictEqual(
+        resolved,
+        worktreeFolder,
+        'must resolve via the exact encoded name for the worktree root, not get thrown off by the file\'s own (different) cwd content',
+      );
     });
   });
 
@@ -235,6 +266,48 @@ suite('sessionStore', () => {
       assert.strictEqual(sessions.length, 2);
       const forked = sessions.find((s) => s.sessionId === newSessionId);
       assert.strictEqual(forked?.firstPrompt, 'hi');
+    });
+  });
+
+  test('listSessionsForScopes merges sessions from multiple scopes, tagging each with its repo', async () => {
+    await withFixture(async ({ claudeHome, workspaceRoot }) => {
+      const { listSessionsForScopes } = await import('../../src/sessionStore');
+
+      const folderA = path.join(claudeHome, 'projects', 'repo-a');
+      const folderB = path.join(claudeHome, 'projects', 'repo-b');
+      await fs.mkdir(folderA, { recursive: true });
+      await fs.mkdir(folderB, { recursive: true });
+
+      const older = '2020-01-01T00:00:00.000Z';
+      const newer = '2020-06-01T00:00:00.000Z';
+
+      await fs.writeFile(
+        path.join(folderA, 'a1.jsonl'),
+        `${JSON.stringify({ type: 'user', isMeta: false, cwd: workspaceRoot, timestamp: older, message: { role: 'user', content: 'from repo a' } })}\n`,
+        'utf8',
+      );
+      await fs.writeFile(
+        path.join(folderB, 'b1.jsonl'),
+        `${JSON.stringify({ type: 'user', isMeta: false, cwd: workspaceRoot, timestamp: newer, message: { role: 'user', content: 'from repo b' } })}\n`,
+        'utf8',
+      );
+
+      const scopes = [
+        { root: '/repo-a', label: 'repo-a', projectFolder: folderA },
+        { root: '/repo-b', label: 'repo-b', projectFolder: folderB },
+        { root: '/repo-c-unresolved', label: 'repo-c', projectFolder: undefined },
+      ];
+
+      const sessions = await listSessionsForScopes(scopes);
+
+      assert.strictEqual(sessions.length, 2, 'the unresolved scope contributes no sessions and is skipped without error');
+      // Sorted by lastActivity descending across BOTH scopes, not grouped per-scope.
+      assert.strictEqual(sessions[0].firstPrompt, 'from repo b');
+      assert.strictEqual(sessions[0].repoRoot, '/repo-b');
+      assert.strictEqual(sessions[0].repoLabel, 'repo-b');
+      assert.strictEqual(sessions[1].firstPrompt, 'from repo a');
+      assert.strictEqual(sessions[1].repoRoot, '/repo-a');
+      assert.strictEqual(sessions[1].repoLabel, 'repo-a');
     });
   });
 

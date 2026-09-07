@@ -1,12 +1,10 @@
 import * as vscode from 'vscode';
 import { SessionItem, SessionListProvider } from '../sessionListProvider';
-import { MetadataStore } from '../metadataStore';
 import { stopBackgroundAgentSafely } from '../backgroundAgents';
 
 export function registerArchiveCommands(
   context: vscode.ExtensionContext,
   listProvider: SessionListProvider,
-  metadataStore: MetadataStore,
   output: vscode.OutputChannel,
 ): void {
   context.subscriptions.push(
@@ -14,6 +12,7 @@ export function registerArchiveCommands(
       if (!item) {
         return;
       }
+      const metadataStore = listProvider.metadataStoreForItem(item);
       // Pinned wins over archived in the list's bucket priority (see SessionListProvider), so an
       // archived-but-still-pinned session would silently stay in Pinned instead of moving to
       // Archived — unpin it here so the action visibly does what it says.
@@ -34,7 +33,7 @@ export function registerArchiveCommands(
       if (!item) {
         return;
       }
-      await metadataStore.setArchived(item.session.sessionId, false);
+      await listProvider.metadataStoreForItem(item).setArchived(item.session.sessionId, false);
       listProvider.refresh();
     }),
   );

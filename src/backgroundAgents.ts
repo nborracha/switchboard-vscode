@@ -12,16 +12,20 @@ export interface BackgroundAgentInfo {
 }
 
 /**
- * Live (not-yet-stopped) `claude --bg` agents for this workspace, keyed by sessionId so callers
- * can cross-reference against our own session list. Fails to an empty map on any error (`claude`
- * missing from PATH, agents subsystem unavailable, malformed output) — this is a pure enhancement,
- * never a hard dependency for listing/opening/deleting sessions.
+ * Live (not-yet-stopped) `claude --bg` agents across every scanned repo scope, keyed by sessionId
+ * so callers can cross-reference against our own session list. Fails to an empty map on any error
+ * (`claude` missing from PATH, agents subsystem unavailable, malformed output) — this is a pure
+ * enhancement, never a hard dependency for listing/opening/deleting sessions.
  */
-export async function listRunningBackgroundAgents(cwd: string): Promise<Map<string, BackgroundAgentInfo>> {
+export async function listRunningBackgroundAgents(cwds: string[]): Promise<Map<string, BackgroundAgentInfo>> {
   const byId = new Map<string, BackgroundAgentInfo>();
+  if (cwds.length === 0) {
+    return byId;
+  }
+  const cwdSet = new Set(cwds);
 
   try {
-    const { stdout } = await execFileAsync('claude', ['agents', '--json', '--all'], { cwd });
+    const { stdout } = await execFileAsync('claude', ['agents', '--json', '--all'], { cwd: cwds[0] });
     const parsed = JSON.parse(stdout) as unknown;
     if (!Array.isArray(parsed)) {
       return byId;
@@ -31,7 +35,12 @@ export async function listRunningBackgroundAgents(cwd: string): Promise<Map<stri
       if (entry && typeof entry === 'object') {
         const e = entry as Record<string, unknown>;
         const isLiveBackgroundAgent =
-          e.kind === 'background' && e.state !== 'stopped' && typeof e.sessionId === 'string' && typeof e.id === 'string' && e.cwd === cwd;
+          e.kind === 'background' &&
+          e.state !== 'stopped' &&
+          typeof e.sessionId === 'string' &&
+          typeof e.id === 'string' &&
+          typeof e.cwd === 'string' &&
+          cwdSet.has(e.cwd);
         if (isLiveBackgroundAgent) {
           byId.set(e.sessionId as string, {
             id: e.id as string,
