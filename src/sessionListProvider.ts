@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'node:path';
 import { ParsedSession, ResolvedScope, ScopedSession, listSessionsForScopes, projectsDir } from './sessionStore';
-import { MetadataStore, SessionMetadata, workspaceIdentity } from './metadataStore';
+import { MetadataStore, SessionMetadata, pickScopedMetadata, workspaceIdentity } from './metadataStore';
 import { readHiddenSessionIds } from './hiddenSessions';
 import { tagColor } from './tagColor';
 import { computeWorkingTransitions } from './workingState';
@@ -216,9 +216,39 @@ export class SessionListProvider implements vscode.WebviewViewProvider, vscode.D
     return store;
   }
 
+  // Flattened across scopes, for callers that only have a sessionId (the content search). The
+  // list itself must NOT use this: see pickScopedMetadata for why a flat merge picks the wrong
+  // entry for a session that changed scope.
   private async mergedMetadata(): Promise<Record<string, SessionMetadata>> {
     const all = await Promise.all([...this.metadataStores.values()].map((store) => store.getAll()));
     return Object.assign({}, ...all);
+  }
+
+  /** Every scope's metadata, keyed by that scope's root — the input to pickScopedMetadata. */
+  private async metadataByScope(): Promise<Map<string, Record<string, SessionMetadata>>> {
+    const entries = await Promise.all(
+      [...this.metadataStores].map(async ([root, store]) => [root, await store.getAll()] as const),
+    );
+    return new Map(entries);
+  }
+
+  /**
+   * Carries a session's pins/tags/archive from one scope's store to another, so a relocated chat
+   * keeps them and leaves no stale entry behind. Returns true when something was actually moved.
+   */
+  async migrateMetadata(sessionId: string, fromRoot: string, toRoot: string): Promise<boolean> {
+    const from = this.metadataStores.get(fromRoot);
+    const to = this.metadataStores.get(toRoot);
+    if (fromRoot === toRoot || !from || !to) {
+      return false;
+    }
+    const entry = (await from.getAll())[sessionId];
+    if (!entry) {
+      return false;
+    }
+    await to.mergeEntry(sessionId, entry);
+    await from.removeSession(sessionId);
+    return true;
   }
 
   /** Merged metadata across every scope — for the full-text content search. */
@@ -359,15 +389,17 @@ export class SessionListProvider implements vscode.WebviewViewProvider, vscode.D
       return buckets;
     }
 
-    const [sessions, metadata, hiddenIds, backgroundAgents] = await Promise.all([
+    const [sessions, metadataByScope, hiddenIds, backgroundAgents] = await Promise.all([
       listSessionsForScopes(this.scopes),
-      this.mergedMetadata(),
+      this.metadataByScope(),
       readHiddenSessionIds(),
       listRunningBackgroundAgents(this.scopes.map((scope) => scope.root)),
     ]);
 
     for (const session of sessions) {
-      const meta = metadata[session.sessionId] ?? {};
+      // Resolved against the scope this session lives in now, not flattened across scopes — a
+      // chat that moved between scopes must not be ruled by the entry its old scope still holds.
+      const meta = pickScopedMetadata(metadataByScope, session.sessionId, session.repoRoot);
       const pinned = !!meta.pinned;
       const archived = !!meta.archived;
       const hidden = hiddenIds.has(session.sessionId);

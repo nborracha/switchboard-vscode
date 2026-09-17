@@ -19,6 +19,38 @@ export interface SessionMetadata {
 
 type MetadataFile = Record<string, SessionMetadata>;
 
+/**
+ * The metadata for one session, out of every scope's store, keyed by scope root.
+ *
+ * The scope the session lives in NOW always wins. A session can change scope — Claude Code moves a
+ * transcript into a worktree's project folder when the agent enters it, and Switchboard's own
+ * "Move into this workspace" moves it back — and each scope keeps its own metadata.json. The entry
+ * left behind in the previous scope is stale: it records what the chat was when it lived there. A
+ * plain merge across stores let that stale entry win (later stores overwrote earlier ones), so a
+ * pin or unarchive clicked after a move was written correctly and then immediately overridden on
+ * the next render, which looked exactly like the click doing nothing.
+ *
+ * Another scope's entry is still used when the owning scope has none, so a pin made before a move
+ * survives the move until the first write in the new scope replaces it.
+ */
+export function pickScopedMetadata(
+  perScope: ReadonlyMap<string, MetadataFile>,
+  sessionId: string,
+  repoRoot: string,
+): SessionMetadata {
+  const own = perScope.get(repoRoot)?.[sessionId];
+  if (own) {
+    return own;
+  }
+  for (const [root, entries] of perScope) {
+    const entry = root === repoRoot ? undefined : entries[sessionId];
+    if (entry) {
+      return entry;
+    }
+  }
+  return {};
+}
+
 function storeRoot(): string {
   return process.env.CLAUDE_CHAT_MANAGER_HOME || path.join(os.homedir(), '.claude-chat-manager');
 }
@@ -87,6 +119,13 @@ export class MetadataStore {
   async setTags(sessionId: string, tags: string[]): Promise<void> {
     const data = await this.load();
     data[sessionId] = { ...data[sessionId], tags };
+    await this.save(data);
+  }
+
+  /** Merges a whole entry in — used to carry a session's pins/tags/archive across a scope move. */
+  async mergeEntry(sessionId: string, meta: SessionMetadata): Promise<void> {
+    const data = await this.load();
+    data[sessionId] = { ...data[sessionId], ...meta };
     await this.save(data);
   }
 

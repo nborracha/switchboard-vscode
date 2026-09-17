@@ -225,6 +225,7 @@ export function registerOpenSessionCommand(
         return;
       }
 
+      const fromRoot = item.repoRoot;
       try {
         const result = await relocateSession(item.session.filePath, item.session.sessionId, targetFolder, primary.root);
         output.appendLine(
@@ -237,6 +238,12 @@ export function registerOpenSessionCommand(
         vscode.window.showErrorMessage(`Could not move "${item.session.title}": ${String(err)}`);
         output.appendLine(`move ${item.session.sessionId} failed: ${String(err)}`);
         return;
+      }
+
+      // Pins/tags/archive live in a per-scope store, so they have to follow the chat into its new
+      // scope — otherwise the entry left in the old scope keeps describing it.
+      if (await listProvider.migrateMetadata(item.session.sessionId, fromRoot, primary.root)) {
+        output.appendLine(`moved metadata for ${item.session.sessionId} from ${fromRoot} to ${primary.root}`);
       }
 
       // The target folder may have just been created — re-discover so it is scoped and watched.

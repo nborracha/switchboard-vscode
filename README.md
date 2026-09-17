@@ -71,7 +71,7 @@ All commands are prefixed `Switchboard:` in the Command Palette. Row-level actio
 ## Where your data lives
 
 - **Read** from Claude Code's own files: `~/.claude/projects/**` transcripts, the live-session registry `~/.claude/sessions/`, and VS Code's global state DB for the official extension's hidden-session list. `git worktree list` supplies the worktree scopes.
-- **Written by Switchboard**: `~/.claude-chat-manager/<workspace-identity>/metadata.json` — pins, tags and archive state, one file per repo or worktree scope. Override the root with `CLAUDE_CHAT_MANAGER_HOME`. That directory keeps its original name so existing metadata isn't orphaned by the rename to Switchboard.
+- **Written by Switchboard**: `~/.claude-chat-manager/<workspace-identity>/metadata.json` — pins, tags and archive state, one file per repo or worktree scope. A chat that changes scope is ruled by the store of the scope it lives in now, and **Move into "<workspace>"** carries its pins, tags and archive state across. Override the root with `CLAUDE_CHAT_MANAGER_HOME`. That directory keeps its original name so existing metadata isn't orphaned by the rename to Switchboard.
 
 Four row actions write to Anthropic-owned transcript files. Each runs only on an explicit click and uses the CLI's own on-disk forms, never an invented one:
 
